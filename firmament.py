@@ -88,7 +88,7 @@ def send_discord(message, verbosity=False):
     global webhooks
 
     payload = {}
-    payload["content"] = message
+    payload["content"] = f"Firmament: {message}"
 
     # loop through the webhooks and send discord messages
     for webhook in webhooks:
@@ -219,9 +219,9 @@ def process(query, complete=True):
 
     print("Processing query:", query)
     if complete:
-        send_discord("Firmament: Processing Missing Systems", True)
+        send_discord("Processing Missing Systems", True)
     else:
-        send_discord("Firmament: Processing Incomplete Systems", True)
+        send_discord("Processing Incomplete Systems", True)
 
     cursor = mysql_conn.cursor(pymysql.cursors.DictCursor)
     cursor.execute(
@@ -291,7 +291,7 @@ def download_and_process_json():
 
 def create_patrol():
     sqltext = """
-    select id64, `system`,CAST(x as CHAR) as x,CAST(y as CHAR) as y,CAST(z as CHAR) as z,'There is no record of this system in Spansh. Please FSS all the bodies in the system.' as instructions,concat('https://spansh.co.uk/api/dump/',id64) as url from (
+    select id64, `system`,CAST(x as CHAR) as x,CAST(y as CHAR) as y,CAST(z as CHAR) as z,'There is no record of bodies in this system on Spansh. Please FSS all the bodies in the system.' as instructions,concat('https://spansh.co.uk/api/dump/',id64) as url from (
 	SELECT DISTINCT CAST(id64 AS CHAR) AS id64, `system` as `system`,x,y,z FROM codexreport cr where not exists
     (select 1 from star_systems ss where ss.id64 = cr.id64)
             and cr.reported_at <= NOW() - INTERVAL 24 HOUR
@@ -299,6 +299,9 @@ def create_patrol():
             SELECT DISTINCT CAST(SystemAddress AS CHAR) AS id64, `system` as name,x,y,z FROM organic_scans cr where not exists
             (select 1 from star_systems ss where ss.id64 = cr.SystemAddress)
             and cr.reported_at <= NOW() - INTERVAL 24 HOUR
+            union
+            select DISTINCT CAST(id64 AS CHAR) AS id64, name as `system`,x,y,z from star_systems ss where not exists 
+            (select 1 from system_bodies sb where sb.system_address = ss.id64)            
 ) data
     """
     cursor = mysql_conn.cursor(pymysql.cursors.DictCursor)
@@ -332,10 +335,10 @@ def main():
     # first we are going to process all the systems that are not in the database
     # then we will work on systems that are out of date
 
-    # process(missing_systems_query)
-    # id64_dict = download_and_process_json()
+    process(missing_systems_query)
+    id64_dict = download_and_process_json()
 
-    # process(incomplete_systems_query, complete=False)
+    process(incomplete_systems_query, complete=False)
 
     store = connect_storage(storage_secrets_file)
     create_patrol()
