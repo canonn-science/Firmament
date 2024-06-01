@@ -4,7 +4,9 @@ import json
 import requests
 import os
 import gzip
-
+from google.oauth2 import service_account
+from google.cloud import storage
+import traceback
 
 """
 This script is used to identify missing and incomplete system data in the Canonn database.
@@ -26,6 +28,9 @@ Around 800 new systems are added each day.
 
 mysql_conn = None
 id64_dict = {}
+webhooks = []
+bucket_name = "canonn-downloads"  # should probably use a config file for this
+store = None  # place holder for the storage location.
 
 
 class SSDictCursor(pymysql.cursors.SSCursor, pymysql.cursors.DictCursorMixin):
@@ -34,6 +39,67 @@ class SSDictCursor(pymysql.cursors.SSCursor, pymysql.cursors.DictCursorMixin):
     """
 
     pass
+
+
+def connect_storage(storage_secrets_file):
+    global bucket_name
+
+    storage_secrets = service_account.Credentials.from_service_account_file(
+        storage_secrets_file
+    )
+    client = storage.Client(credentials=storage_secrets)
+    bucket = client.get_bucket(bucket_name)
+    return bucket
+
+
+def upload_patrol():
+    global store
+
+    try:
+        """Uploads a file to Google Cloud Storage."""
+        blob = store.blob(f"Patrols/missing_spansh_systems.json")
+        # Upload the file
+        blob.upload_from_filename("missing_spansh_systems.json")
+        blob.make_public()
+        send_discord(
+            f"Uploaded [Missing Spansh Patrol](<https://storage.googleapis.com/canonn-downloads/Patrols/missing_spansh_systems.json>) "
+        )
+    except Exception as e:
+        send_discord(f"Error uploading missing_spansh_systems.json")
+        stack_trace = traceback.format_exc()
+        print(stack_trace)
+
+
+def load_webhooks(discord_secrets_file):
+    print("Discord Secrets File:", discord_secrets_file)
+    try:
+        with open(discord_secrets_file, "r") as file:
+            webhooks = json.load(file)
+            return webhooks
+    except FileNotFoundError:
+        print("File not found.")
+        return []
+    except json.JSONDecodeError:
+        print("Error decoding JSON.")
+        return []
+
+
+def send_discord(message, verbosity=False):
+    global webhooks
+
+    payload = {}
+    payload["content"] = message
+
+    # loop through the webhooks and send discord messages
+    for webhook in webhooks:
+        # only send verbose messages
+        if webhook.get("verbose") or verbosity:
+            r = requests.post(
+                webhook.get("webhook"),
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+            print(message)
 
 
 def connect_database(database_secrets_file):
@@ -94,10 +160,10 @@ def fetch_systems(rows, complete):
                     )
 
                 if complete or not changed:
-                    print(f"No change {data.get('name')}")
+                    print(f"Data fetched for update {data.get('name')}")
                     systems.append(data)
                 else:
-                    print(f"Fetched for update {data.get('name')}")
+                    print(f"No change {data.get('name')}")
             else:
                 print(f"Missing {row.get('name')} ({row.get('id64')})")
         # else:
@@ -110,12 +176,19 @@ def fetch_systems(rows, complete):
 missing_systems_query = """
             SELECT DISTINCT CAST(id64 AS CHAR) AS id64, `system` as name FROM codexreport cr where not exists
             (select 1 from star_systems ss where ss.id64 = cr.id64)
+            union 
+            SELECT DISTINCT CAST(SystemAddress AS CHAR) AS id64, `system` as name FROM organic_scans cr where not exists
+            (select 1 from star_systems ss where ss.id64 = cr.SystemAddress)
 """
 
 incomplete_systems_query = """
           SELECT DISTINCT CAST(cr.id64 AS CHAR) AS id64, cr.`system` as name,ifnull(ss.body_count,0) as body_count, ss.len_bodies  FROM codexreport cr
           join star_systems ss on ss.id64 = cr.id64
           where ifnull(ss.bodies_match,0) != 1
+          union
+          SELECT DISTINCT CAST(cr.SystemAddress AS CHAR) AS id64, cr.`system` as name,ifnull(ss.body_count,0) as body_count, ss.len_bodies  FROM organic_scans cr
+          join star_systems ss on ss.id64 = cr.SystemAddress
+          where ifnull(ss.bodies_match,0) != 1  
 """
 
 
@@ -145,11 +218,18 @@ def process(query, complete=True):
     global mysql_conn
 
     print("Processing query:", query)
+    if complete:
+        send_discord("Firmament: Processing Missing Systems", True)
+    else:
+        send_discord("Firmament: Processing Incomplete Systems", True)
 
     cursor = mysql_conn.cursor(pymysql.cursors.DictCursor)
     cursor.execute(
         query,
     )
+
+    systemcount = 0
+    bodycount = 0
     print("Query executed.")
     while True:
         system_values = []
@@ -174,6 +254,10 @@ def process(query, complete=True):
                     body_values.append(body_json)
 
                 system_values.append(json.dumps(data))
+
+        systemcount += len(system_values)
+        bodycount += len(body_values)
+
         if len(system_values) > 0:
             insert_systems(system_values)
         if len(body_values) > 0:
@@ -181,6 +265,8 @@ def process(query, complete=True):
             mysql_conn.commit()
     # close the cursor we are done
     cursor.close()
+    send_discord(f"{systemcount} systems", True)
+    send_discord(f"{bodycount} bodies", True)
 
 
 def download_and_process_json():
@@ -203,19 +289,57 @@ def download_and_process_json():
     return result_dict
 
 
+def create_patrol():
+    sqltext = """
+    select id64, `system`,CAST(x as CHAR) as x,CAST(y as CHAR) as y,CAST(z as CHAR) as z,'There is no record of this system in Spansh. Please FSS all the bodies in the system.' as instructions,concat('https://spansh.co.uk/api/dump/',id64) as url from (
+	SELECT DISTINCT CAST(id64 AS CHAR) AS id64, `system` as `system`,x,y,z FROM codexreport cr where not exists
+    (select 1 from star_systems ss where ss.id64 = cr.id64)
+            and cr.reported_at <= NOW() - INTERVAL 24 HOUR
+            union 
+            SELECT DISTINCT CAST(SystemAddress AS CHAR) AS id64, `system` as name,x,y,z FROM organic_scans cr where not exists
+            (select 1 from star_systems ss where ss.id64 = cr.SystemAddress)
+            and cr.reported_at <= NOW() - INTERVAL 24 HOUR
+) data
+    """
+    cursor = mysql_conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute(
+        sqltext,
+    )
+    patrols = cursor.fetchall()
+    cursor.close()
+
+    with open("missing_spansh_systems.json", "w") as f:
+        json.dump(patrols, f)
+
+    return patrols
+
+
 def main():
     global id64_dict
+    global webhooks
+    global store
     # create the path $HOME/.ssh/database_secrets.json using
     file_location = os.path.join(os.environ["HOME"], ".ssh", "database_secrets.json")
+    storage_secrets_file = os.path.join(
+        os.environ["HOME"], ".ssh", "storage_secrets.json"
+    )
+    webhooks = load_webhooks(
+        os.path.join(os.environ["HOME"], ".ssh", "discord_secrets.json")
+    )
+
     mysql_conn = connect_database(file_location)
 
     # first we are going to process all the systems that are not in the database
     # then we will work on systems that are out of date
 
-    process(missing_systems_query)
-    id64_dict = download_and_process_json()
+    # process(missing_systems_query)
+    # id64_dict = download_and_process_json()
 
-    process(incomplete_systems_query, complete=False)
+    # process(incomplete_systems_query, complete=False)
+
+    store = connect_storage(storage_secrets_file)
+    create_patrol()
+    upload_patrol()
 
 
 main()
