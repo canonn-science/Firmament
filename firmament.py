@@ -141,7 +141,7 @@ def fetch_systems(rows, complete):
 
     for row in rows:
 
-        if complete or id64_dict.get(row.get("id64")):
+        if complete or id64_dict.get(int(row.get("id64"))):
 
             url = f"https://spansh.co.uk/api/dump/{row.get('id64')}"
             response = session.get(url, headers=headers)
