@@ -20,7 +20,7 @@ the database then the script will not attempt to update the database.
 
 Roughly 11% of the 500,000+ systems are incomplete and many will never be fully updated. 
 This means that the second phase of the script  will spend most of its time querying spansh
-without updating. 
+without updating so we download the last 7 days spansh updates and only upload the ones that match. 
 
 Around 800 new systems are added each day. 
 
@@ -52,7 +52,7 @@ def connect_storage(storage_secrets_file):
     return bucket
 
 
-def upload_patrol():
+def upload_patrol(rows):
     global store
 
     try:
@@ -62,7 +62,7 @@ def upload_patrol():
         blob.upload_from_filename("missing_spansh_systems.json")
         blob.make_public()
         send_discord(
-            f"Uploaded [Missing Spansh Patrol](<https://storage.googleapis.com/canonn-downloads/Patrols/missing_spansh_systems.json>) "
+            f"Uploaded [Missing Spansh Patrol](<https://storage.googleapis.com/canonn-downloads/Patrols/missing_spansh_systems.json>) ({rows:,}) rows "
         )
     except Exception as e:
         send_discord(f"Error uploading missing_spansh_systems.json")
@@ -265,8 +265,17 @@ def process(query, complete=True):
             mysql_conn.commit()
     # close the cursor we are done
     cursor.close()
-    send_discord(f"{systemcount} systems", True)
-    send_discord(f"{bodycount} bodies", True)
+    kind = "Incomplete"
+    update = "Updating"
+    if complete:
+        kind = "Missing"
+        update = "Adding"
+
+    payload = f"""
+        {update} {systemcount:,} {kind} systems
+        {update} {bodycount:,} {kind} bodies
+    """
+    send_discord(payload, True)
 
 
 def download_and_process_json():
@@ -287,6 +296,41 @@ def download_and_process_json():
         result_dict[id64] = True
 
     return result_dict
+
+
+# function to get statistics about what systems are missing or complte
+def get_system_stats():
+    cursor = mysql_conn.cursor(pymysql.cursors.DictCursor)
+    cursor.execute(
+        """
+            select
+                sum(case when ss.id64 is null then 1 else 0 end) as missing_systems,  
+                sum(case when ss.id64 is not null and ifnull(ss.bodies_match,0) = 1 then 1 else 0 end) as complete_systems,
+                sum(case when ss.id64 is not null and ifnull(ss.bodies_match,0) = 0 then 1 else 0 end) as incomplete_systems,
+                count(1) as total_systems
+            from (
+            select distinct cr.id64 from codexreport cr
+            union 
+            select distinct SystemAddress as id64 from organic_scans os
+            ) ks 
+            left join star_systems ss on ss.id64 = ks.id64
+        """,
+    )
+
+    row = cursor.fetchone()
+
+    payload = f"""
+    System Stats:
+    Missing Systems: {row['missing_systems']:,}
+    Complete Systems: {row['complete_systems']:,}
+    Incomplete Systems: {row['incomplete_systems']:,}
+    """
+
+    send_discord(payload, True)
+
+    cursor.close()
+
+    return
 
 
 def create_patrol():
@@ -314,7 +358,7 @@ def create_patrol():
     with open("missing_spansh_systems.json", "w") as f:
         json.dump(patrols, f)
 
-    return patrols
+    return len(patrols)
 
 
 def main():
@@ -332,6 +376,8 @@ def main():
 
     mysql_conn = connect_database(file_location)
 
+    get_system_stats()
+
     # first we are going to process all the systems that are not in the database
     # then we will work on systems that are out of date
 
@@ -340,9 +386,17 @@ def main():
 
     process(incomplete_systems_query, complete=False)
 
+    # we will create a patrol for incomplete systems and upload
     store = connect_storage(storage_secrets_file)
-    create_patrol()
-    upload_patrol()
+    rows = create_patrol()
+    upload_patrol(rows)
+
+    get_system_stats()
+    send_discord("Firmament Complete", True)
 
 
-main()
+try:
+    main()
+except Exception as e:
+    send_discord(f"Firmament Error: {e}", True)
+    raise e
